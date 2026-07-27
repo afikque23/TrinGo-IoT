@@ -4,6 +4,17 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <PubSubClient.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+// --- Konfigurasi MPU6050 ---
+Adafruit_MPU6050 mpu;
+bool mpuReady = false;
+float est_velocity_mps = 0.0;
+float est_distance_m = 0.0;
+unsigned long last_mpu_time = 0;
+float mpu_offset_accel = 0.0; // Kalibrasi gravitasi/kemiringan awal
 
 // --- Konfigurasi WiFi ---
 // ⚠️ ISI DENGAN SSID DAN PASSWORD WIFI ANDA
@@ -35,6 +46,7 @@ unsigned long totalCharsReceived = 0;
 unsigned long lastCharCount = 0;
 bool gpsModuleDetected = false;
 bool rawModeDone = false;
+bool is_initial_fix_done = false;
 
 // Reverse Geocoding
 String currentAddress = "Menunggu GPS fix...";
@@ -82,14 +94,20 @@ void connectWiFi() {
   } else {
     wifiConnected = false;
     Serial.println();
-    Serial.println(F("❌ WiFi GAGAL terhubung!"));
+    Serial.println(F("❌ WiFi GAGAL terhubung! (Akan terus mencoba di latar belakang)"));
   }
 }
+
+unsigned long lastMqttReconnectAttempt = 0;
 
 void reconnectMqtt() {
   if (!wifiConnected || WiFi.status() != WL_CONNECTED) return;
   
   if (!mqtt.connected()) {
+    unsigned long now = millis();
+    if (now - lastMqttReconnectAttempt < 5000) return; // Coba tiap 5 detik
+    lastMqttReconnectAttempt = now;
+
     Serial.print(F("🔄 Menghubungkan ke MQTT... "));
     String clientId = "ESP32Client-" + WiFi.macAddress();
     
@@ -98,7 +116,7 @@ void reconnectMqtt() {
     } else {
       Serial.print(F("❌ Gagal, rc="));
       Serial.print(mqtt.state());
-      Serial.println(F(" (Akan dicoba lagi nanti)"));
+      Serial.println(F(" (Akan dicoba lagi dalam 5 detik)"));
     }
   }
 }
@@ -204,15 +222,12 @@ void sendDataToMQTT() {
   
   // Data wajib sesuai struktur Laravel Anda
   doc["device_id"] = WiFi.macAddress();
-  
-  // Ambil waktu saat ini (dari millis atau bisa diganti timestamp epoch jika mau)
-  // Laravel akan otomatis menggunakan 'received_at' jika timestamp kosong, 
-  // namun kita kirimkan millis sebagai penanda.
   doc["timestamp"] = millis(); 
   
-  doc["has_fix"] = gps.location.isValid();
+  bool is_fix = gps.location.isValid() && gps.satellites.value() >= 4;
+  doc["has_fix"] = is_fix;
 
-  if (gps.location.isValid()) {
+  if (is_fix) {
     doc["lat"] = gps.location.lat();
     doc["lng"] = gps.location.lng();
     
@@ -222,10 +237,52 @@ void sendDataToMQTT() {
     
     doc["address"] = currentAddress;
     doc["maps_url"] = mapsUrl;
+  } else {
+    // Jika tidak fix, kirimkan hasil Dead Reckoning MPU6050
+    if (mpuReady) {
+      doc["est_speed_kmh"] = est_velocity_mps * 3.6;
+      doc["est_distance_m"] = est_distance_m;
+    }
   }
   
   if (gps.satellites.isValid()) doc["sat"] = gps.satellites.value();
   if (gps.hdop.isValid()) doc["hdop"] = gps.hdop.hdop();
+
+  // ── TAMBAHAN: Data MPU6050 selalu dikirim (untuk Tabel 4.3 dan analisis) ──
+  if (mpuReady) {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+
+    // Hitung g-force total (resultante 3 sumbu)
+    float gForceTotal = sqrt(
+      a.acceleration.x * a.acceleration.x +
+      a.acceleration.y * a.acceleration.y +
+      a.acceleration.z * a.acceleration.z
+    ) / 9.81; // Konversi m/s² → g
+
+    // Hitung g-force horizontal (X & Y) — sama seperti dead reckoning
+    float gForceHoriz = sqrt(
+      a.acceleration.x * a.acceleration.x +
+      a.acceleration.y * a.acceleration.y
+    ) / 9.81;
+
+    // is_moving: true jika g-force horizontal melebihi threshold (getaran/gerakan)
+    bool isMoving = (gForceHoriz - (mpu_offset_accel / 9.81)) > 0.05;
+
+    doc["mpu_g_force"]   = gForceTotal;   // g-force total (semua sumbu)
+    doc["mpu_is_moving"] = isMoving;       // status gerak
+
+    // Debug ke Serial Monitor
+    Serial.print(F("MPU G-Force Total    : "));
+    Serial.print(gForceTotal, 4);
+    Serial.println(F(" g"));
+    Serial.print(F("MPU G-Force Horiz    : "));
+    Serial.print(gForceHoriz, 4);
+    Serial.println(F(" g"));
+    Serial.print(F("MPU Is Moving        : "));
+    Serial.println(isMoving ? F("MOVING ✅") : F("IDLE 🔵"));
+  }
+  // ─────────────────────────────────────────────────────────────────────────
 
   // Convert JSON to String
   String payload;
@@ -236,6 +293,54 @@ void sendDataToMQTT() {
     Serial.println(F("🚀 [MQTT] Data berhasil dikirim ke server!"));
   } else {
     Serial.println(F("❌ [MQTT] Gagal mengirim data."));
+  }
+}
+
+
+
+void computeDeadReckoning() {
+  if (!mpuReady) return;
+
+  unsigned long now = millis();
+  // Batasi pembacaan MPU maksimal setiap 50ms (20Hz) agar CPU dan I2C tidak kewalahan
+  if (now - last_mpu_time < 50) return;
+
+  float dt = (now - last_mpu_time) / 1000.0;
+  last_mpu_time = now;
+
+  if (gps.location.isValid() && gps.satellites.value() >= 4) {
+    // Jika GPS valid, sinkronkan nilai estimasi dari GPS
+    est_velocity_mps = gps.speed.mps();
+    est_distance_m = 0; // Jarak relatif selama dead reckoning direset
+  } else {
+    // GPS Loss -> Lakukan dead reckoning menggunakan MPU6050
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+
+    // Ambil percepatan horizontal (Asumsi sensor mendatar, gaya Z = gravitasi)
+    float a_horiz = sqrt(a.acceleration.x * a.acceleration.x + a.acceleration.y * a.acceleration.y);
+    
+    // Kurangi dengan nilai kalibrasi (kemiringan awal saat diam)
+    float net_accel = a_horiz - mpu_offset_accel;
+    
+    // Threshold noise statis (sisa noise/getaran kecil)
+    if (abs(net_accel) < 0.5) {
+      net_accel = 0.0;
+    }
+
+    // Integral ke-1: Kecepatan (v = v0 + a * dt)
+    est_velocity_mps += net_accel * dt;
+    if (est_velocity_mps < 0) est_velocity_mps = 0; // Tidak bisa mundur
+
+
+    // Friksi/Decay: Kurangi kecepatan perlahan jika tidak ada percepatan
+    if (net_accel == 0.0 && est_velocity_mps > 0) {
+      est_velocity_mps -= 1.0 * dt; // Asumsi perlambatan 1 m/s^2
+      if (est_velocity_mps < 0) est_velocity_mps = 0;
+    }
+
+    // Integral ke-2: Jarak (s = v * dt)
+    est_distance_m += est_velocity_mps * dt;
   }
 }
 
@@ -398,6 +503,25 @@ void printGPSData() {
     Serial.println(F("Waktu                : BELUM VALID"));
   }
 
+  // Data MPU6050 (Dead Reckoning)
+  Serial.println(F("\n--- Data MPU6050 (Dead Reckoning) ---"));
+  if (mpuReady) {
+    bool is_fix = gps.location.isValid() && gps.satellites.value() >= 4;
+    if (is_fix) {
+      Serial.println(F("Status               : STANDBY (GPS Fix OK)"));
+    } else {
+      Serial.println(F("Status               : AKTIF (GPS Loss)"));
+      Serial.print(F("Estimasi Kecepatan   : "));
+      Serial.print(est_velocity_mps * 3.6);
+      Serial.println(F(" km/jam"));
+      Serial.print(F("Estimasi Jarak       : "));
+      Serial.print(est_distance_m);
+      Serial.println(F(" meter"));
+    }
+  } else {
+    Serial.println(F("Status               : ERROR / KABEL LEPAS"));
+  }
+
   // Uptime
   Serial.print(F("Uptime               : "));
   unsigned long sec = millis() / 1000;
@@ -425,6 +549,33 @@ void setup() {
   mqtt.setBufferSize(1024); // ⬅️ TAMBAHKAN INI: Perbesar ukuran maksimal paket pengiriman
   
   
+  // Inisialisasi MPU6050
+  Wire.begin(22, 21); // SDA = 22, SCL = 21 (Sesuai request)
+  if (!mpu.begin()) {
+    Serial.println(F("⚠️ MPU6050 TIDAK TERDETEKSI! Cek kabel I2C (SDA=22, SCL=21)"));
+  } else {
+    Serial.println(F("✅ MPU6050 Terdeteksi!"));
+    mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    mpuReady = true;
+    
+    // Proses Kalibrasi Otomatis (Mencari nilai gravitasi/kemiringan saat diam)
+    Serial.println(F("⚙️ Mengkalibrasi MPU6050... JANGAN GERAKKAN ALAT (2 DETIK)!"));
+    delay(2000); // Tunggu alat stabil
+    float sum_accel = 0;
+    for (int i = 0; i < 50; i++) {
+      sensors_event_t a, g, temp;
+      mpu.getEvent(&a, &g, &temp);
+      sum_accel += sqrt(a.acceleration.x * a.acceleration.x + a.acceleration.y * a.acceleration.y);
+      delay(10);
+    }
+    mpu_offset_accel = sum_accel / 50.0;
+    Serial.print(F("✅ Kalibrasi selesai! Offset percepatan horizontal: "));
+    Serial.println(mpu_offset_accel);
+
+    last_mpu_time = millis();
+  }
+
   Serial.println();
   Serial.println(F("📡 Menampilkan data NMEA mentah selama 10 detik..."));
   Serial.println(F("   (Jika tidak ada karakter muncul = GPS tidak terhubung)\n"));
@@ -433,11 +584,25 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
+  // Update wifiConnected flag secara dinamis jika ESP32 reconnect ke WiFi di latar belakang
+  if (WiFi.status() == WL_CONNECTED && !wifiConnected) {
+    wifiConnected = true;
+    mqttTopic = "vehicle/" + WiFi.macAddress() + "/telemetry";
+    Serial.print(F("\n✅ WiFi kembali Terhubung! IP: "));
+    Serial.println(WiFi.localIP());
+  } else if (WiFi.status() != WL_CONNECTED && wifiConnected) {
+    wifiConnected = false;
+    Serial.println(F("\n❌ WiFi terputus!"));
+  }
+
   // Koneksi ulang ke MQTT jika terputus
   if (!mqtt.connected()) {
     reconnectMqtt();
   }
   mqtt.loop(); // Wajib dipanggil untuk menjaga koneksi MQTT
+
+  // Kalkulasi estimasi MPU6050 setiap siklus loop
+  computeDeadReckoning();
 
   // Fase 1: Tampilkan raw NMEA selama 10 detik pertama
   if (!rawModeDone && now < 10000) {
@@ -472,15 +637,40 @@ void loop() {
     }
   }
 
-  // Tampilkan dan kirim data setiap 3 detik
+  // Update flag fix pertama kali secara permanen
+  if (gps.location.isValid() && gps.satellites.value() >= 4) {
+    is_initial_fix_done = true;
+  }
+
+  // Tentukan interval pengiriman (Smart Interval Dinonaktifkan sementara)
+  // Default: 5 detik (baik kendaraan berhenti maupun berjalan)
+  unsigned long currentInterval = 5000; 
+  
+  if (gps.location.isValid() && gps.satellites.value() >= 4) {
+    // Gunakan kecepatan GPS jika valid
+    if (gps.speed.isValid() && gps.speed.kmph() > 2.0) {
+      currentInterval = 5000;
+    }
+  } else if (is_initial_fix_done) {
+    // Jika GPS hilang tapi sudah pernah fix (Dead Reckoning MPU6050)
+    if ((est_velocity_mps * 3.6) > 2.0) {
+      currentInterval = 5000;
+    }
+  }
+
+  // Tampilkan dan kirim data sesuai Smart Interval
   static unsigned long lastPrint = 0;
-  if (now - lastPrint > 3000) {
+  if (now - lastPrint > currentInterval || lastPrint == 0) {
     lastPrint = now;
 
     printGPSData();
     printDiagnostics();
     
-    // Kirim data ke MQTT
+    // Kirim data ke MQTT secara terus-menerus (walaupun belum GPS Fix)
+    if (!is_initial_fix_done) {
+      Serial.println(F("\n⚠️ Menunggu GPS Fix... (Data tetap dikirim dengan kordinat 0/kosong)"));
+    }
+    
     sendDataToMQTT();
     
     Serial.println(F("═══════════════════════════════════════"));
