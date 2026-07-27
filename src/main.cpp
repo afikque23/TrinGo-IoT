@@ -232,8 +232,15 @@ void sendDataToMQTT() {
   serializeJson(doc, payload);
 
   // Publish ke topik
-  if (mqtt.publish(mqttTopic.c_str(), payload.c_str())) {
+  unsigned long startMqtt = millis();
+  bool pubSuccess = mqtt.publish(mqttTopic.c_str(), payload.c_str());
+  unsigned long endMqtt = millis();
+  
+  if (pubSuccess) {
     Serial.println(F("🚀 [MQTT] Data berhasil dikirim ke server!"));
+    Serial.print(F("⏱️  [BENCHMARK] Waktu Transmisi MQTT: "));
+    Serial.print(endMqtt - startMqtt);
+    Serial.println(F(" ms"));
   } else {
     Serial.println(F("❌ [MQTT] Gagal mengirim data."));
   }
@@ -476,6 +483,18 @@ void loop() {
   static unsigned long lastPrint = 0;
   if (now - lastPrint > 3000) {
     lastPrint = now;
+
+    // --- BENCHMARK AKUISISI SENSOR ---
+    unsigned long startAcq = micros();
+    bool isLocValid = gps.location.isValid();
+    double lat = isLocValid ? gps.location.lat() : 0.0;
+    double lng = isLocValid ? gps.location.lng() : 0.0;
+    unsigned long endAcq = micros();
+    
+    Serial.print(F("⏱️  [BENCHMARK] Waktu Akuisisi Data Sensor (GPS): "));
+    Serial.print((endAcq - startAcq) / 1000.0, 3);
+    Serial.println(F(" ms"));
+    // ---------------------------------
 
     printGPSData();
     printDiagnostics();
