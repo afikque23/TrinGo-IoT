@@ -161,41 +161,105 @@ void reverseGeocode(double lat, double lng) {
     DeserializationError error = deserializeJson(doc, payload);
     
     if (!error) {
-      // Ambil display_name sebagai alamat lengkap
-      const char* displayName = doc["display_name"];
-      if (displayName) {
-        currentAddress = String(displayName);
-      }
-      
-      // Juga tampilkan detail alamat jika ada
       JsonObject addr = doc["address"];
       if (!addr.isNull()) {
-        String shortAddr = "";
+        String fullAddr = "";
         
-        if (addr.containsKey("road")) shortAddr += String((const char*)addr["road"]);
+        // 1. Nama Jalan / Gang / Akses Pejalan Kaki & Nomor Rumah
+        String streetName = "";
+        if (addr.containsKey("road")) streetName = String((const char*)addr["road"]);
+        else if (addr.containsKey("pedestrian")) streetName = String((const char*)addr["pedestrian"]);
+        else if (addr.containsKey("footway")) streetName = String((const char*)addr["footway"]);
+        else if (addr.containsKey("path")) streetName = String((const char*)addr["path"]);
+        else if (addr.containsKey("residential")) streetName = String((const char*)addr["residential"]);
+        else if (addr.containsKey("alley")) streetName = String((const char*)addr["alley"]);
+        else if (addr.containsKey("service")) streetName = String((const char*)addr["service"]);
+        
+        if (streetName.length() > 0) {
+          fullAddr += streetName;
+          if (addr.containsKey("house_number")) {
+            fullAddr += " No. " + String((const char*)addr["house_number"]);
+          }
+        }
+        
+        // 2. Gedung / Bangunan / Toko / Fasilitas Publik
+        if (addr.containsKey("building")) {
+          if (fullAddr.length() > 0) fullAddr += ", ";
+          fullAddr += String((const char*)addr["building"]);
+        } else if (addr.containsKey("amenity")) {
+          if (fullAddr.length() > 0) fullAddr += ", ";
+          fullAddr += String((const char*)addr["amenity"]);
+        } else if (addr.containsKey("shop")) {
+          if (fullAddr.length() > 0) fullAddr += ", ";
+          fullAddr += String((const char*)addr["shop"]);
+        }
+        
+        // 3. RT / RW / Dusun / Dukuh / Lingkungan (Neighbourhood / Quarter)
+        if (addr.containsKey("neighbourhood")) {
+          if (fullAddr.length() > 0) fullAddr += ", ";
+          fullAddr += String((const char*)addr["neighbourhood"]);
+        }
+        if (addr.containsKey("quarter")) {
+          if (fullAddr.length() > 0) fullAddr += ", ";
+          fullAddr += String((const char*)addr["quarter"]);
+        } else if (addr.containsKey("hamlet")) {
+          if (fullAddr.length() > 0) fullAddr += ", ";
+          fullAddr += String((const char*)addr["hamlet"]);
+        }
+        
+        // 4. Kelurahan / Suburb / Village
         if (addr.containsKey("village")) {
-          if (shortAddr.length() > 0) shortAddr += ", ";
-          shortAddr += String((const char*)addr["village"]);
+          if (fullAddr.length() > 0) fullAddr += ", ";
+          fullAddr += String((const char*)addr["village"]);
         } else if (addr.containsKey("suburb")) {
-          if (shortAddr.length() > 0) shortAddr += ", ";
-          shortAddr += String((const char*)addr["suburb"]);
-        }
-        if (addr.containsKey("city")) {
-          if (shortAddr.length() > 0) shortAddr += ", ";
-          shortAddr += String((const char*)addr["city"]);
-        } else if (addr.containsKey("town")) {
-          if (shortAddr.length() > 0) shortAddr += ", ";
-          shortAddr += String((const char*)addr["town"]);
-        }
-        if (addr.containsKey("state")) {
-          if (shortAddr.length() > 0) shortAddr += ", ";
-          shortAddr += String((const char*)addr["state"]);
+          if (fullAddr.length() > 0) fullAddr += ", ";
+          fullAddr += String((const char*)addr["suburb"]);
         }
         
-        if (shortAddr.length() > 0) {
-          Serial.print(F("📍 Alamat Singkat     : "));
-          Serial.println(shortAddr);
+        // 5. Kecamatan (city_district / district)
+        if (addr.containsKey("city_district")) {
+          if (fullAddr.length() > 0) fullAddr += ", Kec. ";
+          fullAddr += String((const char*)addr["city_district"]);
+        } else if (addr.containsKey("district")) {
+          if (fullAddr.length() > 0) fullAddr += ", Kec. ";
+          fullAddr += String((const char*)addr["district"]);
         }
+        
+        // 6. Kota / Kabupaten
+        if (addr.containsKey("city")) {
+          if (fullAddr.length() > 0) fullAddr += ", ";
+          fullAddr += String((const char*)addr["city"]);
+        } else if (addr.containsKey("town")) {
+          if (fullAddr.length() > 0) fullAddr += ", ";
+          fullAddr += String((const char*)addr["town"]);
+        } else if (addr.containsKey("county")) {
+          if (fullAddr.length() > 0) fullAddr += ", ";
+          fullAddr += String((const char*)addr["county"]);
+        }
+        
+        // 7. Provinsi
+        if (addr.containsKey("state")) {
+          if (fullAddr.length() > 0) fullAddr += ", ";
+          fullAddr += String((const char*)addr["state"]);
+        }
+        
+        // 8. Kode Pos & Negara
+        if (addr.containsKey("postcode")) {
+          if (fullAddr.length() > 0) fullAddr += " ";
+          fullAddr += String((const char*)addr["postcode"]);
+        }
+        if (addr.containsKey("country")) {
+          if (fullAddr.length() > 0) fullAddr += ", ";
+          fullAddr += String((const char*)addr["country"]);
+        }
+        
+        if (fullAddr.length() > 0) {
+          currentAddress = fullAddr;
+        } else if (doc.containsKey("display_name")) {
+          currentAddress = String((const char*)doc["display_name"]);
+        }
+      } else if (doc.containsKey("display_name")) {
+        currentAddress = String((const char*)doc["display_name"]);
       }
       
       lastGeocodeLat = lat;
@@ -203,6 +267,8 @@ void reverseGeocode(double lat, double lng) {
       
       // Update Google Maps URL
       mapsUrl = "https://www.google.com/maps?q=" + String(lat, 6) + "," + String(lng, 6);
+      Serial.print(F("📍 Alamat Rinci      : "));
+      Serial.println(currentAddress);
       Serial.println(F("✅ Alamat berhasil diambil!"));
     } else {
       Serial.print(F("❌ JSON parse error: "));
